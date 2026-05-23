@@ -14,7 +14,7 @@ import sys
 from PIL import Image
 from scene.cameras import Camera
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from scene.hyper_loader import Load_hyper_data, format_hyper_data
@@ -30,6 +30,32 @@ from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.general_utils import PILtoTorch
 from tqdm import tqdm
+
+def load_mask_for_image(
+    data_dir: str,
+    image_name: str,
+    device: str = "cuda",
+    mask_subdir: str = "masks/binary",
+) -> Optional[torch.Tensor]:
+    """
+    讀取 SAM 產生的二值人體遮罩，轉為 float32 Tensor 並移至 GPU。
+
+    檔案命名規則：
+      {data_dir}/masks/binary/{image_name}.png
+
+    影像格式：uint8 灰階，人=255，背景=0
+
+    Return:
+      torch.Tensor, shape [H, W], dtype=float32, 人=1.0, 背景=0.0
+      若找不到遮罩則回傳 None。
+    """
+    mask_path = os.path.join(data_dir, mask_subdir, f"{image_name}.png")
+    if not os.path.exists(mask_path):
+        return None
+    mask_pil    = Image.open(mask_path).convert("L")          # uint8 [H,W]
+    mask_np     = np.array(mask_pil, dtype=np.float32) / 255.0  # 0.0 or 1.0
+    mask_tensor = torch.from_numpy(mask_np).to(device)          # [H,W] float32 GPU
+    return mask_tensor
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -593,17 +619,17 @@ def readPanopticSportsinfos(datadir):
                            )
     return scene_info
 
-def readMultipleViewinfos(datadir,llffhold=8):
+def readMultipleViewinfos(datadir, llffhold=8):
 
     cameras_extrinsic_file = os.path.join(datadir, "sparse_/images.bin")
     cameras_intrinsic_file = os.path.join(datadir, "sparse_/cameras.bin")
     cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
     cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     from scene.multipleview_dataset import multipleview_dataset
-    train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir,split="train")
-    test_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir,split="test")
+    train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir, split="train")
+    test_cam_infos  = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir, split="test")
 
-    train_cam_infos_ = format_infos(train_cam_infos,"train")
+    train_cam_infos_ = format_infos(train_cam_infos, "train")
     nerf_normalization = getNerfppNorm(train_cam_infos_)
 
     ply_path = os.path.join(datadir, "points3D_multipleview.ply")
@@ -616,15 +642,85 @@ def readMultipleViewinfos(datadir,llffhold=8):
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
-    
+
     try:
         pcd = fetchPly(ply_path)
-        
     except:
         pcd = None
-    
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           video_cameras=test_cam_infos.video_cam_infos,
+                           maxtime=0,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+
+def readMultipleViewinfosWithMask(datadir, mask_source_dir=None, llffhold=8):
+    """
+    readMultipleViewinfos 的擴充版本，在 format_infos() 之後
+    額外為每個 CameraInfo 附上對應的 instance mask tensor (cam.mask)。
+
+    mask_source_dir:
+        SAM2 遮罩的根目錄，預設為 datadir 本身
+        (遮罩位於 {mask_source_dir}/masks/instance/{image_name}.png)
+    """
+    if mask_source_dir is None:
+        mask_source_dir = datadir
+
+    cameras_extrinsic_file = os.path.join(datadir, "sparse_/images.bin")
+    cameras_intrinsic_file = os.path.join(datadir, "sparse_/cameras.bin")
+    cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+    cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    from scene.multipleview_dataset import multipleview_dataset
+    train_cam_infos = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir, split="train")
+    test_cam_infos  = multipleview_dataset(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, cam_folder=datadir, split="test")
+
+    # format_infos 產生基本 CameraInfo list
+    train_cam_list = format_infos(train_cam_infos, "train")
+
+    # ── 為每個 CameraInfo 載入 mask ──────────────────────────────────────────
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mask_loaded, mask_missing = 0, 0
+    updated_train_cam_list = []
+    for cam_info in tqdm(train_cam_list, desc="Loading instance masks"):
+        # image_name 格式：'original_time0_0' (由 format_infos 中的 idx 決定)
+        # 我們需要從 image_path 取得原始名稱
+        img_path   = train_cam_infos.image_paths[cam_info.uid] if hasattr(train_cam_infos, 'image_paths') else None
+        image_stem  = Path(img_path).stem if img_path else f"{cam_info.uid}"
+        mask_tensor = load_mask_for_image(mask_source_dir, image_stem, device=device)
+        if mask_tensor is not None:
+            mask_loaded += 1
+        else:
+            mask_missing += 1
+        # CameraInfo 是 NamedTuple，需用 _replace 產生新實例
+        updated_cam = cam_info._replace(mask=mask_tensor)
+        updated_train_cam_list.append(updated_cam)
+
+    print(f"[Mask] Loaded: {mask_loaded}, Missing: {mask_missing} (stored as None)")
+
+    nerf_normalization = getNerfppNorm(updated_train_cam_list)
+
+    ply_path = os.path.join(datadir, "points3D_multipleview.ply")
+    bin_path = os.path.join(datadir, "points3D_multipleview.bin")
+    txt_path = os.path.join(datadir, "points3D_multipleview.txt")
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=updated_train_cam_list,   # list with masks
                            test_cameras=test_cam_infos,
                            video_cameras=test_cam_infos.video_cam_infos,
                            maxtime=0,
@@ -638,5 +734,7 @@ sceneLoadTypeCallbacks = {
     "dynerf" : readdynerfInfo,
     "nerfies": readHyperDataInfos,  # NeRFies & HyperNeRF dataset proposed by [https://github.com/google/hypernerf/releases/tag/v0.1]
     "PanopticSports" : readPanopticSportsinfos,
-    "MultipleView": readMultipleViewinfos
+    "MultipleView": readMultipleViewinfos,
+    # 多物件風格轉換：MultipleView + SAM2 instance mask
+    "MultipleViewWithMask": readMultipleViewinfosWithMask,
 }
