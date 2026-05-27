@@ -263,6 +263,8 @@ class Neural3D_NDC_Dataset(Dataset):
         poses = poses_arr[:, :-2].reshape([-1, 3, 5])  # (N_cams, 3, 5)
         self.near_fars = poses_arr[:, -2:]
         videos = glob.glob(os.path.join(self.root_dir, "cam*.mp4"))
+        if len(videos) == 0:
+            videos = [d for d in glob.glob(os.path.join(self.root_dir, "cam*")) if os.path.isdir(d)]
         videos = sorted(videos)
         # breakpoint()
         assert len(videos) == poses_arr.shape[0]

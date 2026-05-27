@@ -262,13 +262,20 @@ CUDA_VISIBLE_DEVICES=0 python refine_sds.py \
     --image_guidance_scale 1.2
 ```
 
+> **整體架構與核心原理 (`refine_sds.py`)**：
+> 1. **聯合渲染 (Joint Rendering)**：每一輪隨機挑選 4 個視角，同時渲染出 RGB 影像與 2D 遮罩 (利用剛注入高斯點的 `_mask` 屬性)。
+> 2. **雙分支預測 (Dual Forward)**：將渲染出的影像加上雜訊後，分別送入 InstructPix2Pix 的 UNet 兩次。一次使用 `prompt_fg` 預測前景的梯度 (noise_pred_fg)，一次使用 `prompt_bg` 預測背景的梯度 (noise_pred_bg)。
+> 3. **空間融合 (Spatial Blending)**：在 Latent 空間中，利用 2D 遮罩將兩組梯度完美融合：
+>    `noise_pred = noise_pred_fg * mask_latent + noise_pred_bg * (1.0 - mask_latent)`
+> 4. **背景錨定 (Background Anchor)**：除了 SDS Loss 以外，系統會額外計算一個強烈的 L1 Loss (`Ll1_bg`)，強制約束「背景區域」必須與原始影像保持一致，避免被 SDS 的隨機雜訊帶走而產生崩壞或飄移。
+
 > **參數說明**：
 > - `--prompt_fg`：前景（人物）的編輯指令
 > - `--prompt_bg`：背景的編輯指令（設為 `"none"` 則背景不受 SDS 影響，只有 L1 anchor 保持原樣）
 > - `--guidance_scale`：SDS guidance 強度（建議 7.5~12.5，越高越強但可能更模糊）
 > - `--image_guidance_scale`：image conditioning 強度（建議 1.0~1.5）
 
-> **SDS 的已知限制**：SDS loss 天生有 over-smoothing 的問題，結果會比 edit_3d 稍微模糊。這是正常的，SDS 的目標是改善**時間一致性**而非清晰度。
+> **SDS 的已知限制**：SDS loss 天生有 over-smoothing 的問題，結果會比 edit_3d 稍微模糊。這是正常的，SDS 的目標是改善**時間與視角一致性**，讓 4D 動態在各個角度看起來更平順。
 
 ### Step 7: 渲染最終影片
 

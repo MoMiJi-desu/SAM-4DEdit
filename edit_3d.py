@@ -255,7 +255,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 elif scene_name not in ['sear_steak', 'coffee_martini', 'cook_spinach'] and scene.maxtime < 6000:
                     raise NotImplementedError("sorry, please check the camera settings manually and set the dict_(scene_name)")
                 elif scene_name == 'sear_steak':
-                    image = Image.open(os.path.join(edited_images_path, f"edited_{prompt.split(' ')[-1].replace('?', '')}_original_time0_{dict_sear_steak[int(viewpoint_cam.image_name)]}.png"))
+                    image = Image.open(os.path.join(edited_images_path, f"original_time0_{dict_sear_steak[int(viewpoint_cam.image_name)]}.png"))
                 # 👆 到這裡結束 👆
                 elif scene_name == 'coffee_martini':
                     image = Image.open(os.path.join(edited_images_path, f"original_time0_{dict_coffee_martini[int(viewpoint_cam.image_name)]}.png"))
