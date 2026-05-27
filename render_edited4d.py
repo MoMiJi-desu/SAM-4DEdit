@@ -135,7 +135,9 @@ if __name__ == "__main__":
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
     gaussians.load_ply(args.ply_path)
-    gaussians.load_model(os.path.join(args.model_path, 'point_cloud', 'iteration_14000')) ##########
+    deform_dir = os.path.dirname(args.ply_path)
+    gaussians.load_model(deform_dir)
+    print(f"Loaded deformation from {deform_dir}")
     
     after_xyz = gaussians.get_xyz
     print("after edit: ", gaussians.get_xyz.shape)

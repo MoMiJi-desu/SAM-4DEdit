@@ -258,9 +258,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     image = Image.open(os.path.join(edited_images_path, f"edited_{prompt.split(' ')[-1].replace('?', '')}_original_time0_{dict_sear_steak[int(viewpoint_cam.image_name)]}.png"))
                 # 👆 到這裡結束 👆
                 elif scene_name == 'coffee_martini':
-                    image = Image.open(os.path.join(edited_images_path, f"edited_{prompt.split(' ')[-1].replace('?', '')}_original_time0_{dict_coffee_martini[int(viewpoint_cam.image_name)]}.png"))
+                    image = Image.open(os.path.join(edited_images_path, f"original_time0_{dict_coffee_martini[int(viewpoint_cam.image_name)]}.png"))
                 else:
-                    image = Image.open(os.path.join(edited_images_path, f"edited_{prompt.split(' ')[-1].replace('?', '')}_original_time0_{1+int(viewpoint_cam.image_name)//scene.maxtime}.png"))
+                    image = Image.open(os.path.join(edited_images_path, f"original_time0_{1+int(viewpoint_cam.image_name)//scene.maxtime}.png"))
                 transform = transforms.ToTensor()
                 gt_image = transform(image).cuda()
             else:
@@ -525,7 +525,7 @@ if __name__ == "__main__":
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    edited_images_path = f"./data/{args.dataset}/{args.scene}/{args.prompt.split(' ')[-1].replace('?', '')}"
+    edited_images_path = f"./data/{args.dataset}/time0_{args.scene}/hybrid"
 
     training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, edited_images_path, args.prompt, args.scene)
 

@@ -109,11 +109,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            shs_final = None # Mutually exclusive
         else:
             pass
             # shs = 
     else:
         colors_precomp = override_color
+        shs_final = None # Mutually exclusive
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # time3 = get_time()

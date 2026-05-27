@@ -31,31 +31,30 @@ from scene.gaussian_model import BasicPointCloud
 from utils.general_utils import PILtoTorch
 from tqdm import tqdm
 
-def load_mask_for_image(
+def load_mask_and_hybrid(
     data_dir: str,
     image_name: str,
     device: str = "cuda",
-    mask_subdir: str = "masks/binary",
-) -> Optional[torch.Tensor]:
+) -> tuple:
     """
-    讀取 SAM 產生的二值人體遮罩，轉為 float32 Tensor 並移至 GPU。
-
-    檔案命名規則：
-      {data_dir}/masks/binary/{image_name}.png
-
-    影像格式：uint8 灰階，人=255，背景=0
-
-    Return:
-      torch.Tensor, shape [H, W], dtype=float32, 人=1.0, 背景=0.0
-      若找不到遮罩則回傳 None。
+    讀取 SAM 產生的二值人體遮罩，與 IP2P 產生的 hybrid image。
     """
-    mask_path = os.path.join(data_dir, mask_subdir, f"{image_name}.png")
-    if not os.path.exists(mask_path):
-        return None
-    mask_pil    = Image.open(mask_path).convert("L")          # uint8 [H,W]
-    mask_np     = np.array(mask_pil, dtype=np.float32) / 255.0  # 0.0 or 1.0
-    mask_tensor = torch.from_numpy(mask_np).to(device)          # [H,W] float32 GPU
-    return mask_tensor
+    mask_tensor = None
+    mask_path = os.path.join(data_dir, "masks/binary", f"{image_name}.png")
+    if os.path.exists(mask_path):
+        mask_pil    = Image.open(mask_path).convert("L")
+        mask_np     = np.array(mask_pil, dtype=np.float32) / 255.0
+        mask_tensor = torch.from_numpy(mask_np).to(device)
+
+    hybrid_tensor = None
+    hybrid_path = os.path.join(data_dir, "hybrid", f"{image_name}.png")
+    if os.path.exists(hybrid_path):
+        hybrid_pil = Image.open(hybrid_path).convert("RGB")
+        # Ensure it is converted to tensor [C, H, W] in [0, 1] range just like original_image
+        hybrid_tensor = PILtoTorch(hybrid_pil, None).to(device)
+
+    return mask_tensor, hybrid_tensor
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -69,6 +68,7 @@ class CameraInfo(NamedTuple):
     height: int
     time : float
     mask: np.array
+    hybrid_image: np.array
    
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -142,7 +142,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image = PILtoTorch(image,None)
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height,
-                              time = float(idx/len(cam_extrinsics)), mask=None) # default by monocular settings.
+                              time = float(idx/len(cam_extrinsics)), mask=None, hybrid_image=None) # default by monocular settings.
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -280,7 +280,7 @@ def generateCamerasFromTransforms(path, template_transformsfile, extension, maxt
         FovX = fovx
         cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=None, image_name=None, width=image.shape[1], height=image.shape[2],
-                            time = time, mask=None))
+                            time = time, mask=None, hybrid_image=None))
     return cam_infos
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", mapper = {}):
     cam_infos = []
@@ -318,7 +318,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.shape[1], height=image.shape[2],
-                            time = time, mask=None))
+                            time = time, mask=None, hybrid_image=None))
             
     return cam_infos
 def read_timeline(path):
@@ -382,7 +382,7 @@ def format_infos(dataset,split):
     image = dataset[0][0]
     if split == "train":
         for idx in tqdm(range(len(dataset))):
-            image_path = None
+            image_path = dataset.image_paths[idx]
             image_name = f"{idx}"
             time = dataset.image_times[idx]
             # matrix = np.linalg.inv(np.array(pose))
@@ -391,7 +391,7 @@ def format_infos(dataset,split):
             FovY = focal2fov(dataset.focal[0], image.shape[2])
             cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                                 image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
-                                time = time, mask=None))
+                                time = time, mask=None, hybrid_image=None))
 
     return cameras
 
@@ -446,7 +446,7 @@ def format_render_poses(poses,data_infos):
         FovY = focal2fov(data_infos.focal[0], image.shape[1])
         cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.shape[2], height=image.shape[1],
-                            time = time, mask=None))
+                            time = time, mask=None, hybrid_image=None))
     return cameras
 
 def add_points(pointsclouds, xyz_min, xyz_max):
@@ -683,23 +683,26 @@ def readMultipleViewinfosWithMask(datadir, mask_source_dir=None, llffhold=8):
 
     # ── 為每個 CameraInfo 載入 mask ──────────────────────────────────────────
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mask_loaded, mask_missing = 0, 0
+    mask_loaded, hybrid_loaded, missing = 0, 0, 0
     updated_train_cam_list = []
-    for cam_info in tqdm(train_cam_list, desc="Loading instance masks"):
+    for cam_info in tqdm(train_cam_list, desc="Loading instance masks and hybrids"):
         # image_name 格式：'original_time0_0' (由 format_infos 中的 idx 決定)
         # 我們需要從 image_path 取得原始名稱
         img_path   = train_cam_infos.image_paths[cam_info.uid] if hasattr(train_cam_infos, 'image_paths') else None
         image_stem  = Path(img_path).stem if img_path else f"{cam_info.uid}"
-        mask_tensor = load_mask_for_image(mask_source_dir, image_stem, device=device)
+        mask_tensor, hybrid_tensor = load_mask_and_hybrid(mask_source_dir, image_stem, device=device)
         if mask_tensor is not None:
             mask_loaded += 1
         else:
-            mask_missing += 1
+            missing += 1
+        if hybrid_tensor is not None:
+            hybrid_loaded += 1
+            
         # CameraInfo 是 NamedTuple，需用 _replace 產生新實例
-        updated_cam = cam_info._replace(mask=mask_tensor)
+        updated_cam = cam_info._replace(mask=mask_tensor, hybrid_image=hybrid_tensor)
         updated_train_cam_list.append(updated_cam)
 
-    print(f"[Mask] Loaded: {mask_loaded}, Missing: {mask_missing} (stored as None)")
+    print(f"[Mask/Hybrid] Masks Loaded: {mask_loaded}, Hybrids Loaded: {hybrid_loaded}, Missing Masks: {missing} (stored as None)")
 
     nerf_normalization = getNerfppNorm(updated_train_cam_list)
 

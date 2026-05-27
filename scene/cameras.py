@@ -18,7 +18,7 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", time = 0,
-                 mask = None, depth=None
+                 mask = None, depth=None, hybrid_image=None
                  ):
         super(Camera, self).__init__()
 
@@ -50,6 +50,10 @@ class Camera(nn.Module):
                                                 #   , device=self.data_device)
         self.depth = depth
         self.mask = mask
+        if hybrid_image is not None:
+            self.hybrid_image = hybrid_image.clamp(0.0, 1.0)[:3,:,:]
+        else:
+            self.hybrid_image = None
         self.zfar = 100.0
         self.znear = 0.01
 

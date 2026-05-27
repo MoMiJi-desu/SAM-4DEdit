@@ -181,7 +181,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             images.append(image.unsqueeze(0))
-            if scene.dataset_type!="PanopticSports":
+            if hasattr(viewpoint_cam, 'hybrid_image') and viewpoint_cam.hybrid_image is not None:
+                gt_image = viewpoint_cam.hybrid_image.cuda()
+            elif scene.dataset_type!="PanopticSports":
                 gt_image = viewpoint_cam.original_image.cuda()
             else:
                 gt_image  = viewpoint_cam['image'].cuda()
@@ -205,6 +207,25 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         
 
         loss = Ll1
+
+        # Mask Rendering & Supervision
+        mask_loss = 0.0
+        if hasattr(viewpoint_cams[0], 'mask') and viewpoint_cams[0].mask is not None:
+            # We assume batch_size=1 or we handle all cameras. Let's handle all:
+            mask_loss_total = 0.0
+            for viewpoint_cam in viewpoint_cams:
+                gt_mask = viewpoint_cam.mask.cuda() # [H, W]
+                # Prepare override_color for mask rendering
+                mask_val = torch.sigmoid(gaussians._mask) # (N, 1)
+                override_color = mask_val.repeat(1, 3) # (N, 3)
+                
+                render_mask_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=override_color, stage=stage, cam_type=scene.dataset_type)
+                rendered_mask = render_mask_pkg["render"][0] # Take first channel since all 3 are identical [H, W]
+                
+                mask_loss_total += l1_loss(rendered_mask, gt_mask)
+            mask_loss = mask_loss_total / len(viewpoint_cams)
+            loss += mask_loss
+
         if stage == "fine" and hyper.time_smoothness_weight != 0:
             # tv_loss = 0
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)

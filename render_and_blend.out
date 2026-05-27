@@ -1,0 +1,18 @@
+feature_dim: 32
+Loading trained model at iteration 99999
+meta data loaded, total image:5100
+meta data loaded, total image:300
+  0%|          | 0/5100 [00:00<?, ?it/s]100%|██████████| 5100/5100 [00:00<00:00, 179430.20it/s]
+0it [00:00, ?it/s]300it [00:00, 72290.66it/s]
+origin points, 39031
+after points, 39031
+Loading Training Cameras
+Loading Test Cameras
+Loading Video Cameras
+Deformation Net Set aabb [ 619.82574463   19.39848709 1246.93554688] [-354.77529907 -184.56646729    6.42394876]
+Voxel Plane: set aabb= Parameter containing:
+tensor([[ 619.8257,   19.3985, 1246.9355],
+        [-354.7753, -184.5665,    6.4239]])
+loading model from exists./output/dynerf/coffee_martini_masked/point_cloud/iteration_99999
+Rendering camera 0
+Saved overlay visualization to /tmp2/martinlin/Instruct-4DGS/overlay_visualization.png

@@ -66,8 +66,12 @@ import os
 from pytorch_lightning import seed_everything   
 
 def encode_1(ip2p, input):
-    latents = ip2p.vae.encode(2*input-1).latent_dist.sample() * 0.18215  # (b*f, 4, h//4, w//4)
-    return latents
+    # Per-frame encoding to avoid OOM (matching refine_sds.py)
+    latents_list = []
+    for i in range(input.shape[0]):
+        latent = ip2p.vae.encode(2 * input[i:i+1] - 1).latent_dist.sample() * 0.18215
+        latents_list.append(latent)
+    return torch.cat(latents_list, dim=0)
 
 def encode_2(ip2p, input):
     image_latents = ip2p.vae.encode(2*input-1).latent_dist.mode() # (b*f, 4, h//4, w//4)
@@ -75,21 +79,18 @@ def encode_2(ip2p, input):
     
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, train_iter,timer, ip2p):
+                         gaussians, scene, stage, tb_writer, train_iter,timer, ip2p, guidance_scale, image_guidance_scale):
     
     torch_dtype = torch.float16
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     sequence_length = 4
-    prompt = "What if it was painted by Monet?"
-    guidance_scale = 8.5
-    image_guidance_scale = 1.5
     diffusion_step = 20
     num_train_timesteps = 1000
     ###
     
     first_iter = 0
-    gaussians.training_only3dgs_setup(opt) #edit optimization params
+    gaussians.training_only3dgs_setup(opt) # Freeze deformation + mask (paper Section 5.3: only refine canonical 3DGS attributes)
     
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -185,16 +186,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 viewpoint_cams=[]
                 viewpoint_cams1 = next(loader)
                 viewpoint_cams2 = next(loader)
-                
                 viewpoint_cams.extend(viewpoint_cams1)
                 viewpoint_cams.extend(viewpoint_cams2)
-                assert len(viewpoint_cams)==sequence_length, "Cams length is not equal to seg_length"
+                # Keep sequence_length = 4, randomly sample from collected cams
+                sequence_length = 4
+                if len(viewpoint_cams) > sequence_length:
+                    viewpoint_cams = random.sample(viewpoint_cams, sequence_length)
             except StopIteration:
                 print("reset dataloader into random dataloader.")
                 if not random_loader:
                     viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=32,collate_fn=list)
                     random_loader = True
                 loader = iter(viewpoint_stack_loader)
+                continue
 
         else:
             idx = 0
@@ -218,8 +222,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         radii_list = []
         visibility_filter_list = []
         viewspace_point_tensor_list = []
+        mask_list = []
 
-        print(viewpoint_cams)
+        # print(viewpoint_cams)
         for viewpoint_cam in viewpoint_cams:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -233,11 +238,21 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
+
+            # Render Mask
+            mask_val = torch.sigmoid(gaussians._mask)
+            override_color = mask_val.repeat(1, 3)
+            # Create a purely black background for mask rendering to prevent mask bleeding in white backgrounds
+            black_background = torch.zeros_like(background)
+            render_mask_pkg = render(viewpoint_cam, gaussians, pipe, black_background, override_color=override_color, stage=stage, cam_type=scene.dataset_type)
+            rendered_mask = render_mask_pkg["render"][0] # [H, W]
+            mask_list.append(rendered_mask.unsqueeze(0).unsqueeze(0)) # [1, 1, H, W]
                 
         radii = torch.cat(radii_list,0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
         image_tensor = torch.cat(images,0)
         gt_image_tensor = torch.cat(gt_images,0)
+        mask_tensor = torch.cat(mask_list, 0) # [seq_len, 1, H, W]
         
         dataset_length, C, H, W = image_tensor.shape
         
@@ -264,45 +279,76 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         image_latents = rearrange(image_latents, "(b f) c h w -> b c f h w", f=sequence_length).to(device=device, dtype=torch_dtype)  # (b, 4, f, h//4, w//4)
         uncond_image_latents = torch.zeros_like(image_latents)
 
-        prompt_embeds = ip2p._encode_prompt(
-            prompt,
+        # Downsample mask to latent shape
+        mask_latent = F.interpolate(mask_tensor, size=(new_height//8, new_width//8), mode='bilinear', align_corners=False).to(device=device, dtype=torch_dtype)
+        # Binarize to avoid fuzzy boundaries that cause IP2P to melt the edges
+        mask_latent = (mask_latent > 0.5).to(dtype=torch_dtype)
+        mask_latent = rearrange(mask_latent, "(b f) c h w -> b c f h w", f=sequence_length) # (1, 1, f, h//8, w//8)
+        mask_latent = mask_latent.repeat(1, 4, 1, 1, 1) # (1, 4, f, h//8, w//8)
+
+        # Encode prompts
+        prompt_embeds_fg = ip2p._encode_prompt(
+            args.prompt_fg,
             device=device,
             num_images_per_prompt=1,
             do_classifier_free_guidance=True,
         ) # [3b, 77, 768]
+        
+        if args.prompt_bg and args.prompt_bg.lower() != "none":
+            prompt_embeds_bg = ip2p._encode_prompt(
+                args.prompt_bg,
+                device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True,
+            )
+        else:
+            prompt_embeds_bg = None # [3b, 77, 768]
         
         ip2p.scheduler.config.num_train_timesteps = num_train_timesteps
         ip2p.scheduler.set_timesteps(diffusion_step)
         
         noise = torch.randn_like(latents) # (b, 4, f, h//4, w//4)
         t = torch.randint(
-            int(1000*0.02 - 1), #scheduler.config.num_train_timesteps
+            int(1000*0.02 - 1), 
             int(1000*0.98),
             [1],
             dtype=torch.long,
             device=device,
         )
-        latents = ip2p.scheduler.add_noise(latents, noise, t)  
-        #print("noise: ", noise.shape) # 1x4xfx96x128
+        latents_noisy = ip2p.scheduler.add_noise(latents, noise, t)  
         
-        image_latents = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0) # (3b, 4, f, h//4, w//4)
+        image_latents_ip2p = torch.cat([image_latents, image_latents, uncond_image_latents], dim=0) # (3b, 4, f, h//4, w//4)
 
-        latent_model_input = torch.cat([latents] * 3) # [3b, 4, sequence_length, h//4, w//4]
-        latent_model_input = torch.cat([latent_model_input, image_latents], dim=1) # [3b, 8, sequence_length, h//4, w//4]
-    
-        # predict the noise residual
+        latent_model_input = torch.cat([latents_noisy] * 3) # [3b, 4, sequence_length, h//4, w//4]
+        latent_model_input = torch.cat([latent_model_input, image_latents_ip2p], dim=1) # [3b, 8, sequence_length, h//4, w//4]
     
         with torch.no_grad():
-            noise_pred = ip2p.unet(latent_model_input, t, prompt_embeds, None, None, False)[0] # [3b, 4, sequence_length, h//4, w//4]
-
-            # perform classifier-free guidance
-            noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
+            # 1. Forward for Foreground
+            noise_pred_fg_all = ip2p.unet(latent_model_input, t, prompt_embeds_fg, None, None, False)[0]
+            noise_pred_fg_text, noise_pred_fg_image, noise_pred_fg_uncond = noise_pred_fg_all.chunk(3)
             
-            noise_pred = (
-                noise_pred_uncond
-                + guidance_scale * (noise_pred_text - noise_pred_image)
-                + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
+            noise_pred_fg = (
+                noise_pred_fg_uncond
+                + guidance_scale * (noise_pred_fg_text - noise_pred_fg_image)
+                + image_guidance_scale * (noise_pred_fg_image - noise_pred_fg_uncond)
             )
+
+            # 2. Forward for Background (only if prompt_bg is provided)
+            if args.prompt_bg and args.prompt_bg.lower() != "none":
+                noise_pred_bg_all = ip2p.unet(latent_model_input, t, prompt_embeds_bg, None, None, False)[0]
+                noise_pred_bg_text, noise_pred_bg_image, noise_pred_bg_uncond = noise_pred_bg_all.chunk(3)
+                
+                noise_pred_bg = (
+                    noise_pred_bg_uncond
+                    + guidance_scale * (noise_pred_bg_text - noise_pred_bg_image)
+                    + image_guidance_scale * (noise_pred_bg_image - noise_pred_bg_uncond)
+                )
+            else:
+                # If no background prompt, set noise_pred_bg to noise so gradient becomes 0
+                noise_pred_bg = noise
+
+            # 3. Spatial Blending
+            noise_pred = noise_pred_fg * mask_latent + noise_pred_bg * (1.0 - mask_latent)
         
         alphas = ip2p.scheduler.alphas_cumprod.to(device)
         w = (1 - alphas[t]).view(-1, 1, 1, 1)
@@ -310,11 +356,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         grad = w * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
         
-        target = (latents - grad).detach().to(dtype=torch.float16)
-        loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / sequence_length
+        target = (latents_noisy - grad).detach().to(dtype=torch.float16)
+        loss_sds = 0.5 * F.mse_loss(latents_noisy, target, reduction="sum") / sequence_length
         loss_sds = loss_sds.to(dtype=torch.float16)
 
-        print("loss SDS: ", loss_sds)
+        # print("loss SDS: ", loss_sds)
         # Loss
         # breakpoint()
         # Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
@@ -322,18 +368,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
         
-        loss = loss_sds
+        # [FIX] Add L1 loss to the background to strongly anchor it and prevent the deformation network from blurring it
+        bg_mask = 1.0 - mask_tensor
+        Ll1_bg = l1_loss(image_tensor * bg_mask, gt_image_tensor[:,:3,:,:] * bg_mask)
+        
+        loss = loss_sds + 1000.0 * Ll1_bg
         if stage == "fine" and hyper.time_smoothness_weight != 0:
             # tv_loss = 0
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
             loss += tv_loss
-        # if opt.lambda_dssim != 0:
-        #    ssim_loss = ssim(image_tensor,gt_image_tensor)
         #    loss += opt.lambda_dssim * (1.0-ssim_loss)
         # if opt.lambda_lpips !=0:
         #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
         #     loss += opt.lambda_lpips * lpipsloss
-        print(loss)
+        # print(loss)
         loss.backward()
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
@@ -407,7 +455,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
-def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
+def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, guidance_scale, image_guidance_scale):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
@@ -415,9 +463,10 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     timer = Timer()
     scene = Scene(dataset, gaussians, load_coarse=None)
     gaussians.load_ply(args.ply_path)
-    print(f"Loaded ply from ${args.ply_path}")
+    print(f"Loaded ply from {args.ply_path}")
     
-    gaussians.load_model(os.path.join(args.model_path,"point_cloud","iteration_" + str(14000)))
+    # [FIX] Load the deformation network from the 3D-edited iteration folder instead of the unedited 14000 folder
+    gaussians.load_model(os.path.dirname(args.ply_path))
     gaussians._deformation_table = torch.gt(torch.ones((gaussians.get_xyz.shape[0]),device="cuda"),0)
     print("Loaded deformation field")
     timer.start()
@@ -450,7 +499,7 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     print("Ready IP2P")
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, "fine", tb_writer, 3000,timer, ip2p)
+                         gaussians, scene, "fine", tb_writer, 800,timer, ip2p, guidance_scale, image_guidance_scale)
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:
@@ -541,15 +590,20 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3000, 5000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[100, 300, 500, 1000,1500,2000,3000,5000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[800])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[100, 300, 500, 800])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
     
+    parser.add_argument("--prompt_fg", type=str, default="Make it a Fauvism painting")
+    parser.add_argument("--prompt_bg", type=str, default="none")
+    
     parser.add_argument("--ply_path", type=str, default = "")
+    parser.add_argument('--guidance_scale', type=float, default=10.5)
+    parser.add_argument('--image_guidance_scale', type=float, default=1.2)
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -567,7 +621,7 @@ if __name__ == "__main__":
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname)
+    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.expname, args.guidance_scale, args.image_guidance_scale)
 
     # All done
     print("\nTraining complete.")
