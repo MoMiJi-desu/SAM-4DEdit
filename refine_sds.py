@@ -95,8 +95,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     ###
     
     first_iter = 0
-    gaussians.training_only3dgs_setup(opt) #edit optimization params
-    
+
+    gaussians.training_only3dgs_setup(opt)
+    if checkpoint:
+        # breakpoint()
+        if stage == "coarse" and stage not in checkpoint:
+            print("start from fine stage, skip coarse stage.")
+            # process is in the coarse stage, but start from fine stage
+            return
+        else: #if stage in checkpoint: 
+            checkpoint = os.path.expanduser(checkpoint) ##
+            (model_params, _) = torch.load(checkpoint)
+            gaussians.restore(model_params, opt)
+            print("Load from chkpnt: ",gaussians.get_xyz.shape)
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 

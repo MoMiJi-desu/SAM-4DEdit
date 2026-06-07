@@ -345,6 +345,8 @@ class GaussianModel:
         mask_np = np.zeros((xyz.shape[0], 1))
         if "mask" in plydata.elements[0]._property_lookup:
             mask_np = np.asarray(plydata.elements[0]["mask"])[..., np.newaxis]
+        elif "mask_0" in plydata.elements[0]._property_lookup:
+            mask_np = np.asarray(plydata.elements[0]["mask_0"])[..., np.newaxis]
         self._mask = nn.Parameter(torch.tensor(mask_np, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
