@@ -196,17 +196,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 viewpoint_cams.extend(viewpoint_cams2) #
                 #TODO: maybe need fix
                 #print(len(viewpoint_cams))
-                # ⭐️ 新增這行：把抓到的 8 個視角，直接「砍半」只取前 4 個，配合系統的安全負載！
+                # 新增這行：把抓到的 8 個視角，直接「砍半」只取前 4 個，配合系統的安全負載！
                 # viewpoint_cams = viewpoint_cams[:sequence_length]
                 # 確保保留這行：讓系統乖乖接受 8 個視角
                 # sequence_length = len(viewpoint_cams)
-                # 1. 把系統的安全負載長度設為 4 (保證 A6000 絕對吃得下)
+                
                 sequence_length = 4 
 
-                # 2. 隨機從所有攝影機中抽出 4 個視角！(這行是靈魂！)
+                # 2. 隨機抽出 4 個視角！
                 if len(viewpoint_cams) > sequence_length:
                     viewpoint_cams = random.sample(viewpoint_cams, sequence_length)
-                # print(f"👉 [Debug] viewpoint_cams length: {len(viewpoint_cams)}, seg_length: {sequence_length}")
+                # print(f" [Debug] viewpoint_cams length: {len(viewpoint_cams)}, seg_length: {sequence_length}")
                 # assert len(viewpoint_cams)==sequence_length, "Cams length is not equal to seg_length"
             except StopIteration:
                 print("reset dataloader into random dataloader.")
@@ -378,11 +378,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         
-        # Background L1 anchor loss: prevent background from drifting
+        # Background L1 anchor loss: prevent background from drifting (ONLY if prompt_bg is 'none')
         bg_mask = 1.0 - mask_tensor  # [seq_len, 1, H, W]
         Ll1_bg = l1_loss(image_tensor * bg_mask, gt_image_tensor[:,:3,:,:] * bg_mask)
         
-        loss = loss_sds + 1000.0 * Ll1_bg
+        if prompt_bg and prompt_bg.lower() != "none":
+            loss = loss_sds  # Let SDS freely edit the background
+        else:
+            loss = loss_sds + 1000.0 * Ll1_bg  # Anchor background to original
         
         # Time smoothness regularization
         if stage == "fine" and hyper.time_smoothness_weight != 0:
